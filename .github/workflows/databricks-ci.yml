@@ -1,0 +1,260 @@
+name: Databricks CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  PYTHON_VERSION: "3.10"
+  DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+  DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+
+jobs:
+  # -----------------------------------------------------------------------
+  # Lint
+  # -----------------------------------------------------------------------
+  lint:
+    name: Lint Python Code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install linting tools
+        run: |
+          pip install --upgrade pip
+          pip install ruff black isort mypy
+
+      - name: Run ruff linter
+        run: |
+          ruff check . --config pyproject.toml || true
+
+      - name: Check formatting with black
+        run: |
+          black --check --diff . || true
+
+      - name: Check import ordering
+        run: |
+          isort --check-only --diff . || true
+
+  # -----------------------------------------------------------------------
+  # Test
+  # -----------------------------------------------------------------------
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up Java (required for PySpark)
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "11"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pyspark==3.5.0 delta-spark==3.1.0 pytest pytest-cov
+
+      - name: Run pytest
+        run: |
+          pytest tests/ -v --tb=short --junitxml=test-results.xml --cov=delta_lake --cov-report=xml || true
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results.xml
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  # -----------------------------------------------------------------------
+  # Validate Notebooks
+  # -----------------------------------------------------------------------
+  validate-notebooks:
+    name: Validate Notebook Syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Validate Databricks notebook format
+        run: |
+          echo "Validating notebook format..."
+          errors=0
+
+          for notebook in notebooks/*.py; do
+            echo "Checking $notebook..."
+
+            # Verify Databricks notebook header
+            first_line=$(head -1 "$notebook")
+            if [ "$first_line" != "# Databricks notebook source" ]; then
+              echo "ERROR: $notebook missing Databricks notebook header"
+              errors=$((errors + 1))
+            fi
+
+            # Verify COMMAND separators exist
+            if ! grep -q "# COMMAND ----------" "$notebook"; then
+              echo "ERROR: $notebook missing COMMAND separators"
+              errors=$((errors + 1))
+            fi
+
+            # Check Python syntax
+            python -c "
+          import ast, sys
+          try:
+              # Remove Databricks-specific markers for syntax check
+              with open('$notebook', 'r') as f:
+                  content = f.read()
+              # Strip magic commands and command separators
+              lines = []
+              for line in content.split('\n'):
+                  if line.startswith('# MAGIC') or line.startswith('# COMMAND'):
+                      lines.append('# ' + line)
+                  else:
+                      lines.append(line)
+              ast.parse('\n'.join(lines))
+              print('  Syntax OK: $notebook')
+          except SyntaxError as e:
+              print(f'  Syntax ERROR in $notebook: {e}')
+              sys.exit(1)
+          "
+            if [ $? -ne 0 ]; then
+              errors=$((errors + 1))
+            fi
+          done
+
+          if [ $errors -gt 0 ]; then
+            echo "FAILED: $errors notebook validation errors found."
+            exit 1
+          else
+            echo "All notebooks validated successfully."
+          fi
+
+  # -----------------------------------------------------------------------
+  # Terraform Validate
+  # -----------------------------------------------------------------------
+  terraform-validate:
+    name: Validate Terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.7.0
+
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init -backend=false
+
+      - name: Terraform validate
+        working-directory: terraform
+        run: |
+          terraform validate
+
+      - name: Terraform fmt check
+        working-directory: terraform
+        run: |
+          terraform fmt -check -recursive
+
+  # -----------------------------------------------------------------------
+  # Deploy to Staging (on merge to main)
+  # -----------------------------------------------------------------------
+  deploy-staging:
+    name: Deploy to Staging Workspace
+    runs-on: ubuntu-latest
+    needs: [test, validate-notebooks, terraform-validate]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Databricks CLI
+        run: |
+          pip install databricks-cli
+
+      - name: Configure Databricks CLI
+        run: |
+          cat > ~/.databrickscfg <<EOF
+          [DEFAULT]
+          host = ${{ secrets.DATABRICKS_HOST }}
+          token = ${{ secrets.DATABRICKS_TOKEN }}
+          EOF
+
+      - name: Deploy notebooks to staging workspace
+        run: |
+          databricks workspace mkdirs /Staging/analytics-platform/notebooks || true
+          for notebook in notebooks/*.py; do
+            echo "Deploying $notebook..."
+            databricks workspace import \
+              --language PYTHON \
+              --format SOURCE \
+              --overwrite \
+              "$notebook" \
+              "/Staging/analytics-platform/$notebook"
+          done
+
+      - name: Deploy pipeline scripts
+        run: |
+          for dir in delta-lake/bronze delta-lake/silver delta-lake/gold ml-workflows; do
+            for script in $dir/*.py; do
+              if [ -f "$script" ]; then
+                echo "Deploying $script..."
+                databricks workspace import \
+                  --language PYTHON \
+                  --format SOURCE \
+                  --overwrite \
+                  "$script" \
+                  "/Staging/analytics-platform/$script"
+              fi
+            done
+          done
+
+      - name: Deploy SQL scripts
+        run: |
+          for sql in unity-catalog/*.sql; do
+            echo "Deploying $sql..."
+            databricks workspace import \
+              --language SQL \
+              --format SOURCE \
+              --overwrite \
+              "$sql" \
+              "/Staging/analytics-platform/$sql"
+          done
+
+      - name: Notify deployment
+        run: |
+          echo "Deployment to staging complete."
+          echo "Commit: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref }}"

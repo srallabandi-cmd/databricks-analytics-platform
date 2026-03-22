@@ -1,0 +1,198 @@
+# =============================================================================
+# Delta Lake Pipeline Configuration
+# =============================================================================
+# Centralized configuration for the Bronze -> Silver -> Gold medallion pipeline.
+
+# ---------------------------------------------------------------------------
+# Global settings
+# ---------------------------------------------------------------------------
+catalog: analytics_platform
+environment: production
+
+sources:
+  base_path: /mnt/raw-data
+  checkpoint_base: /mnt/checkpoints
+
+  events:
+    path: /mnt/raw-data/events
+    format: json
+    primary_key: event_id
+    timestamp_column: event_timestamp
+    schema:
+      - { name: event_id,        type: string,    nullable: false }
+      - { name: user_id,         type: string,    nullable: false }
+      - { name: event_type,      type: string,    nullable: true  }
+      - { name: event_timestamp, type: timestamp, nullable: true  }
+      - { name: session_id,      type: string,    nullable: true  }
+      - { name: page_url,        type: string,    nullable: true  }
+      - { name: referrer,        type: string,    nullable: true  }
+      - { name: device_type,     type: string,    nullable: true  }
+      - { name: os,              type: string,    nullable: true  }
+      - { name: browser,         type: string,    nullable: true  }
+      - { name: ip_address,      type: string,    nullable: true  }
+      - { name: country,         type: string,    nullable: true  }
+      - { name: city,            type: string,    nullable: true  }
+      - { name: properties,      type: string,    nullable: true  }
+
+  transactions:
+    path: /mnt/raw-data/transactions
+    format: json
+    primary_key: transaction_id
+    timestamp_column: transaction_timestamp
+    schema:
+      - { name: transaction_id,        type: string,    nullable: false }
+      - { name: user_id,               type: string,    nullable: false }
+      - { name: amount,                type: double,    nullable: true  }
+      - { name: currency,              type: string,    nullable: true  }
+      - { name: transaction_timestamp, type: timestamp, nullable: true  }
+      - { name: transaction_status,    type: string,    nullable: true  }
+      - { name: payment_method,        type: string,    nullable: true  }
+      - { name: product_id,            type: string,    nullable: true  }
+      - { name: product_category,      type: string,    nullable: true  }
+      - { name: quantity,              type: integer,   nullable: true  }
+
+  users:
+    path: /mnt/raw-data/users
+    format: csv
+    primary_key: user_id
+    timestamp_column: null
+    schema:
+      - { name: user_id,      type: string,  nullable: false }
+      - { name: email,         type: string,  nullable: true  }
+      - { name: full_name,     type: string,  nullable: true  }
+      - { name: signup_date,   type: date,    nullable: true  }
+      - { name: user_segment,  type: string,  nullable: true  }
+      - { name: country,       type: string,  nullable: true  }
+      - { name: platform,      type: string,  nullable: true  }
+      - { name: age_group,     type: string,  nullable: true  }
+      - { name: is_active,     type: boolean, nullable: true  }
+
+# ---------------------------------------------------------------------------
+# Quality rules per layer
+# ---------------------------------------------------------------------------
+quality_rules:
+  bronze:
+    max_rescued_data_pct: 5.0       # Quarantine if > 5% bad records
+    dedup_enabled: true
+
+  silver:
+    null_checks:
+      events:
+        columns: [event_id, user_id, event_timestamp]
+        max_null_pct: 1.0
+      transactions:
+        columns: [transaction_id, user_id, amount]
+        max_null_pct: 1.0
+      users:
+        columns: [user_id, email]
+        max_null_pct: 0.5
+
+    range_checks:
+      transactions:
+        amount:
+          min: 0.0
+          max: 1000000.0
+        quantity:
+          min: 1
+          max: 10000
+
+    referential_integrity:
+      transactions:
+        - { fk_column: user_id, reference_table: users, pk_column: user_id }
+
+    pii_columns:
+      events: [ip_address]
+      users: [email, full_name]
+
+  gold:
+    freshness_sla_hours: 6          # Alert if Gold tables are older than 6h
+    min_row_count:
+      daily_active_users: 1
+      daily_revenue: 1
+      conversion_rates: 1
+
+# ---------------------------------------------------------------------------
+# Partitioning strategy
+# ---------------------------------------------------------------------------
+partitioning:
+  bronze:
+    events: [year, month, day]
+    transactions: [year, month]
+    users: []
+
+  silver:
+    events: []                      # ZORDER instead of partition
+    transactions: []
+    users: []
+
+  gold:
+    daily_active_users: []
+    daily_revenue: []
+    retention_cohorts: []
+
+# ---------------------------------------------------------------------------
+# Table optimization
+# ---------------------------------------------------------------------------
+optimization:
+  silver:
+    events:
+      zorder: [event_timestamp, user_id]
+    transactions:
+      zorder: [transaction_timestamp, user_id]
+    users:
+      zorder: [user_id]
+
+  gold:
+    daily_active_users:
+      zorder: [event_date]
+    daily_revenue:
+      zorder: [txn_date]
+    customer_ltv:
+      zorder: [user_id]
+
+# ---------------------------------------------------------------------------
+# Retention policies
+# ---------------------------------------------------------------------------
+retention:
+  bronze:
+    vacuum_hours: 168               # 7 days
+    log_retention_days: 30
+
+  silver:
+    vacuum_hours: 168
+    log_retention_days: 30
+
+  gold:
+    vacuum_hours: 336               # 14 days
+    log_retention_days: 90
+
+# ---------------------------------------------------------------------------
+# Schedule configuration
+# ---------------------------------------------------------------------------
+schedule:
+  bronze_ingestion:
+    trigger: "continuous"           # Auto Loader streaming
+    checkpoint_interval_seconds: 60
+
+  silver_transformation:
+    cron: "0 */2 * * *"            # Every 2 hours
+    timeout_minutes: 60
+    retries: 2
+
+  gold_aggregation:
+    cron: "0 6 * * *"             # Daily at 06:00 UTC
+    timeout_minutes: 120
+    retries: 2
+    depends_on: silver_transformation
+
+  model_training:
+    cron: "0 8 * * 1"             # Weekly on Monday at 08:00 UTC
+    timeout_minutes: 240
+    retries: 1
+    depends_on: gold_aggregation
+
+  model_inference:
+    cron: "0 10 * * *"            # Daily at 10:00 UTC
+    timeout_minutes: 60
+    retries: 2
+    depends_on: gold_aggregation
